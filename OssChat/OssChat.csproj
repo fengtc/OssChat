@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>7ca2f0e0-f994-49b5-859c-9626793b84dd</UserSecretsId>
+    <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Remove="wwwroot\images\send-fill.svg" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Blazored.LocalStorage" Version="4.5.0" />
+    <PackageReference Include="DevExpress.Blazor" Version="24.1.4" />
+    <PackageReference Include="Markdig" Version="0.38.0" />
+    <PackageReference Include="Microsoft.Extensions.Http.Polly" Version="9.0.0" />
+    <PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.21.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="ParateraNetUtil.Utils" Version="1.0.1.1" />
+  </ItemGroup>
+</Project>

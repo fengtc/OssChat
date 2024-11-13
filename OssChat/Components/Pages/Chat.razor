@@ -1,0 +1,25 @@
+﻿@page "/Chat"
+@using OssChat.ComponentsCustom
+@using static OssChat.ComponentsCustom.ChatBase
+@inject IConfiguration _configuration
+<ChatBase ChatConfig="@ChatConfig"></ChatBase>
+
+@code {
+    private ChatBaseConfig ChatConfig { get; set; }
+    protected override async Task OnInitializedAsync()
+    {
+        ChatConfig = new ChatBaseConfig()
+            {
+                ChatServiceApi = _configuration["OssAgentServiceApi"],
+                ChatServiceToken = _configuration["OssAgentServiceToken"],
+                ChatUseUserToken = Convert.ToBoolean(_configuration["OssAgentUseUserToken"]),
+                ModelConfig = new ChatModelConfig()
+                {
+                    ModeName = _configuration["ChatModelConfig:ModeName"],
+                    MaxTokens = Convert.ToInt32(_configuration["ChatModelConfig:MaxTokens"]),
+                    IsStream = Convert.ToBoolean(_configuration["ChatModelConfig:IsStream"]),
+                    ChatApi = $"{_configuration["OssAgentServiceApi"]}{_configuration["ChatModelConfig:ChatApi"]}",
+                }
+            };
+    }
+}

@@ -1,0 +1,17 @@
+﻿@inherits LayoutComponentBase
+@inject NavigationManager _navigationManager
+
+<div class="page">
+    @Body
+</div>
+
+@code{
+    protected override async Task OnInitializedAsync()
+    {
+        var chatUri = _navigationManager.BaseUri + "Chat";
+        if (_navigationManager.Uri != chatUri)
+        {
+            _navigationManager.NavigateTo(chatUri);
+        }
+    }
+}

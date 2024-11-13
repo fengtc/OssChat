@@ -1,0 +1,44 @@
+﻿@using Microsoft.AspNetCore.Mvc.ViewFeatures
+@inject IFileVersionProvider FileVersionProvider
+@inject IHostEnvironment Env
+
+<!DOCTYPE html>
+<html lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    <link href=@AppendVersion("_content/DevExpress.Blazor.Themes/blazing-berry.bs5.min.css") rel="stylesheet" />
+
+    @DxResourceManager.RegisterScripts()
+    <link href=@AppendVersion("css/site.css") rel="stylesheet" />
+    <link href=@AppendVersion("OssChat.styles.css") rel="stylesheet" />
+    <HeadOutlet @rendermode="new InteractiveServerRenderMode(prerender: false)" />
+</head>
+<body>
+    <Routes @rendermode="new InteractiveServerRenderMode(prerender: false)" />
+    <div id="blazor-error-ui">
+        @if (Env.IsDevelopment())
+        {
+            <text>
+                发生了一个未处理的异常。详细信息请参见浏览器开发工具。
+            </text>
+        }
+        else
+        {
+            <text>
+                发生错误。此应用程序在重新加载之前可能不再响应。
+            </text>
+        }
+        <a href="" class="reload">重新加载</a>
+        <a class="dismiss">🗙</a>
+    </div>
+    <script src="_framework/blazor.web.js" autostart="false"></script>
+    <script src=@AppendVersion("js/boot.js") asp-append-version="true"></script>
+</body>
+
+</html>
+
+@code{
+    private string AppendVersion(string path) => FileVersionProvider.AddFileVersionToPath("/", path);
+}

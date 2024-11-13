@@ -1,0 +1,2489 @@
+﻿@using Blazored.LocalStorage
+@using DevExpress.Blazor
+@using DevExpress.Blazor.Internal.VirtualScrollViewer
+@using DevExtreme.AspNet.Data
+@using Markdig
+@using Markdig.Extensions.Tables
+@using Microsoft.AspNetCore.Components.Web
+@using Microsoft.JSInterop
+@using Newtonsoft.Json
+@using System.Text.RegularExpressions;
+@using System.Net.Http.Headers
+@using System.Text.Json.Serialization
+@using System.ComponentModel.DataAnnotations
+@using System.ComponentModel.DataAnnotations.Schema
+@using System.Text
+@using System.ComponentModel
+@using Newtonsoft.Json.Converters
+@using ParateraNetUtil.Utils.Auths
+@using ParateraNetUtil.Utils.Https
+@using System.Net.Mime
+@using ParateraNetUtil.Utils.Values
+@using Polly
+@using Polly.Extensions.Http
+@inject IJSRuntime JS
+@inject ChatClient? _chatClient
+@inject ILogger<ChatBase> _logger
+@inject IOssAgentService _ossAgentService
+@inject ILocalStorageService _localStorage
+
+<DxStackLayout CssClass="chat-DxStackLayout" Orientation="Orientation.Vertical">
+    <Items>
+        <DxStackLayoutItem Length="2fr">
+            <Template>
+                <div style="display:flex;justify-content:center;">
+                    <DxWaitIndicator Visible="@IsLoadMoreData"
+                                     AnimationType="WaitIndicatorAnimationType.Spin" />
+                </div>
+                <DxListBox @ref="AIListBox" Data="@ChatData"
+                           @bind-Value="@BindChatValue" SelectionMode="ListBoxSelectionMode.None"
+                           ReadOnly="true" id="chat-list-box"
+                           CssClass="chat-content-listbox">
+                    <ItemTemplate Context="ListItemContext">
+                        <div class="@getContetClass(ListItemContext.UserType)">
+                            <div class="@getMessageClass(ListItemContext.UserType)">
+                                @if (ListItemContext.UserType == "AI")
+                                {
+                                    <div style="margin-bottom: 5px;">
+                                        <img class="chat-photo" src="/images/chat/robot.jpg" />
+                                    </div>
+
+                                    <DxWaitIndicator Visible="!ListItemContext.IsFinish" CssClass="send-wait-indicator" />
+                                    @if (ListItemContext.ReplyContent == "无权限")
+                                    {
+                                        <div style="overflow-x:auto;">
+                                            <span>
+                                                您的帐号暂没开通，如需提前可点【<a href="javascript:void(0);" @onclick="@ApplyPermissionBotSend">申请</a>】 加入等待列表
+                                            </span>
+                                        </div>
+                                    }
+                                    else
+                                    {
+                                        <div style="overflow-x:auto;">@ConvertToMarkdown(ListItemContext.ReplyContent, ListItemContext.UserType)</div>
+                                    }
+                                }
+                                else
+                                {
+                                    <div style="margin-bottom: 5px; text-align:right">
+                                        <img class="chat-photo" src="/images/chat/person-circle.svg" />
+                                    </div>
+                                    <div>@ConvertToMarkdown(ListItemContext.Content, ListItemContext.UserType)</div>
+                                }
+
+                            </div>
+                        </div>
+                    </ItemTemplate>
+                    <EmptyDataAreaTemplate Context="EmptyContext">
+                        <DxStackLayout CssClass="w-100 ch-480" Orientation="Orientation.Vertical">
+                            <Items>
+                                <DxStackLayoutItem>
+                                    <Template>
+                                        <div class="empty-data-img">
+                                            <img src="/images/chat/logo2.png" />
+                                        </div>
+                                    </Template>
+                                </DxStackLayoutItem>
+                                <DxStackLayoutItem>
+                                    <Template>
+                                        <div class="empty-data-container">
+                                            @foreach (var item in EmptyItems)
+                                            {
+                                                <DxButton Text="@item.Text" RenderStyle="ButtonRenderStyle.Secondary" RenderStyleMode="ButtonRenderStyleMode.Outline" CssClass="empty-data-button" Click="@(()=>EmptyItemClick(item.Text))" />
+                                            }
+                                        </div>
+                                    </Template>
+                                </DxStackLayoutItem>
+                            </Items>
+                        </DxStackLayout>
+                    </EmptyDataAreaTemplate>
+                </DxListBox>
+            </Template>
+        </DxStackLayoutItem>
+        <DxStackLayoutItem Length="auto">
+            <Template>
+                <DxMemo @ref="ChatMemo" @bind-Text="SendText" @onkeydown="@OnKeyDown" ResizeMode="MemoResizeMode.Disabled" BindValueMode="BindValueMode.OnInput" Rows="2" CssClass="cw-480" style="margin:5px; border-radius:10px; padding-right:40px; font-size:15px; " Enabled="!IsSending" NullText="Enter 发送" />
+                <DxButton Context="SendButtonContext" Click="@Send" Enabled="!IsSending" CssClass="chat-send-button" IconCssClass="icon-send-fill">
+                </DxButton>
+            </Template>
+        </DxStackLayoutItem>
+        <DxStackLayoutItem Length="auto">
+            <Template>
+                <div style="display: flex;">
+                    <div class="icp">
+                        AI回复可能出现错误，重要信息请核查
+                    </div>
+                </div>
+            </Template>
+        </DxStackLayoutItem>
+    </Items>
+</DxStackLayout>
+
+<div class="d-flex align-items-center custom-toast-background">
+    <DxToastProvider Name="CustomToast"
+                     MaxToastCount="5"
+                     AnimationType="ToastAnimationType.Slide"
+                     ThemeMode="ToastThemeMode.Saturated"
+                     ShowCloseButton="false"
+                     HorizontalAlignment="HorizontalAlignment.Center"
+                     VerticalAlignment="VerticalEdge.Top" />
+</div>
+
+@code{
+    #region 参数配置
+    [Parameter] public ChatBaseConfig ChatConfig { get; set; } = new ChatBaseConfig();
+    #endregion
+    #region 内部参数
+    [Inject] IToastNotificationService ToastService { get; set; }
+    DxListBox<ChatMessage, ChatMessage> AIListBox;
+    List<ChatMessage> ChatData { get; set; } = new List<ChatMessage>();
+    DxMemo ChatMemo;
+    ChatMessage BindChatValue { get; set; }
+    private string LoginUserSessionId { get; set; }
+    private string ServiceName { get; set; }
+    private bool IsMobileLogin = false;
+    #endregion
+
+    protected override async Task OnInitializedAsync()
+    {
+        ServiceName = ChatConfig.ServiceName;
+        LoginUserSessionId = $"{ServiceName}{ChatConfig.ClaimsInfo.WXUserId}";
+        var isMobile = await _localStorage.GetItemAsync<bool?>("is_mobile_login");
+        if (isMobile == false) { IsMobileLogin = false; };
+        ChatConfig.EmptyQuickQuestions.ForEach(item =>
+        {
+            EmptyItems.Add(new ChatToolbarItem() { Text = item });
+        });
+        if (ChatConfig.EnableHistoryData)
+        {
+            await SetChatData();
+        }
+        //初始化OpenAI接口请求对象
+        await InitChatClient();
+        await base.OnInitializedAsync();
+        StateHasChanged();
+        await JS.InvokeVoidAsync("scrollListBoxToBottom", "chat-list-box");
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            if (ChatConfig.EnableHistoryData)
+            {
+                await JS.InvokeVoidAsync("registerScrollEvent", "chat-list-box", DotNetObjectReference.Create(this));
+            }
+        }
+        if (IsSending)
+        {
+            await JS.InvokeVoidAsync("scrollListBoxToBottom", "chat-list-box");
+        }
+
+    }
+
+    #region 初始化AI请求参数
+    /// <summary>
+    /// AI问答模型配置
+    /// </summary>
+    private ChatModelConfig ModelConfig { get; set; }
+    //openai接口入参对象
+    private OpenAIRequest openAIRequest { get; set; }
+    private List<Message> sendMessageList = new List<Message>();
+    //初始化OpenAI接口请求对象
+    async Task InitChatClient()
+    {
+        var userToken = Convert.ToBoolean(ChatConfig.ChatUseUserToken);
+        var token = ChatConfig.ChatServiceToken;
+        if (userToken)
+        {
+            token = await _localStorage.GetItemAsync<string>("oss_token");
+        }
+        ModelConfig = ChatConfig.ModelConfig;
+        ModelConfig.Token = token;
+        #region 初始化OpenAI接口
+        //入参对象
+        openAIRequest = new OpenAIRequest()
+            {
+                model = ModelConfig.ModeName,
+                max_tokens = ModelConfig.MaxTokens,
+                stream = ModelConfig.IsStream,
+                messages = new List<Message>()
+            };
+
+
+        _chatClient.ChatApi = ModelConfig.ChatApi;
+        _chatClient.Stream = ModelConfig.IsStream;
+        _chatClient.MaxTextLength = ModelConfig.MaxTokens;
+        _chatClient.Authentication = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", ModelConfig.Token); ;
+
+        #endregion
+
+        //流式输出 配置
+        await InitOutputEvents(ModelConfig.IsStream);
+    }
+
+    //初始化OpenAI接口的输出事件
+    private async Task InitOutputEvents(bool isStream)
+    {
+        string outputType = isStream ? "流式" : "非流式";
+
+        //等待请求
+        _chatClient.OnWaitEvent += delegate (object sender, CallBackModel callBackData)
+        {
+            _ = InvokeAsync(async () =>
+            {
+                _logger.LogInformation($"[{outputType}] OnWaitEvent");
+            });
+        };
+        //开始请求
+        _chatClient.OnStartEvent += delegate (object sender, CallBackModel callBackData)
+        {
+            _ = InvokeAsync(() =>
+            {
+                _logger.LogInformation($"[{outputType}] OnStartEvent");
+            });
+        };
+        //回复内容
+        _chatClient.OnMessage += delegate (object sender, CallBackModel callBackData)
+        {
+            _ = InvokeAsync(async () =>
+            {
+                if (!isStream)
+                {
+                    _logger.LogInformation($"[{outputType}] OnMessage");
+                }
+
+                string answer = callBackData.Message;
+
+                //没有回复内容时，直接返回
+                if (string.IsNullOrEmpty(answer))
+                {
+                    return;
+                }
+
+                //记录回复内容
+                var item = ChatData.FirstOrDefault(n => n.GroupId == callBackData.GroupId && n.UserType == "AI");
+                if (item != null)
+                {
+                    item.ReplyContent += answer;
+                }
+                StateHasChanged();
+                //调整滚动条的位置 到底部
+                //await AIListBox.MakeDataItemVisibleAsync(item);
+            });
+        };
+        //报错信息
+        _chatClient.OnErrorEvent += delegate (object sender, Exception e, CallBackModel callBackData)
+        {
+            _ = InvokeAsync(async () =>
+            {
+                _logger.LogInformation($"[{outputType}] OnErrorEvent");
+
+                //记录报错内容
+                var item = ChatData.FirstOrDefault(n => n.GroupId == callBackData.GroupId && n.UserType == "AI");
+                if (item != null)
+                {
+                    item.ReplyContent += e.Message;
+                }
+                StateHasChanged();
+                //调整滚动条的位置 到底部
+                //await AIListBox.MakeDataItemVisibleAsync(item);
+            });
+        };
+        //请求完成
+        _chatClient.OnFinishEvent += delegate (object sender, CallBackModel callBackData)
+        {
+            _ = InvokeAsync(async () =>
+            {
+                _logger.LogInformation($"[{outputType}] OnFinishEvent");
+
+
+                //记录耗时
+                var item = ChatData.FirstOrDefault(n => n.GroupId == callBackData.GroupId && n.UserType == "AI");
+                if (item != null)
+                {
+                    item.ReplyTime = DateTime.Now;
+                    item.asnwer_times = (DateTime.Now - item.Time).TotalSeconds;
+                    item.IsFinish = true;
+                    sendMessageList.Add(new Message() { role = "assistant", content = item.ReplyContent });
+                    UpdateChatLog(item);
+                }
+
+
+                //提问按钮启用
+                IsSending = false;
+                //刷新页面数据
+                StateHasChanged();
+                await JS.InvokeVoidAsync("scrollListBoxToBottom", "chat-list-box");
+                if (!IsMobileLogin)
+                {
+                    await ChatMemo.FocusAsync();
+                }
+            });
+        };
+    }
+    #endregion
+
+    #region 初始化历史数据
+    int HistoryDataCount = 0;
+    bool NoLoadData = false;
+    public async Task SetChatData()
+    {
+        // 默认实现
+        if (ChatConfig.ClaimsInfo != null)
+        {
+            ChatData = ChatData ?? new List<ChatMessage>();
+            var options = new DataSourceLoadOptionsBase();
+            options.Skip = HistoryDataCount;
+            options.Take = 10;
+            options.Sort = new SortingInfo[]
+            {
+               new SortingInfo(){Desc = true,Selector = "start_date"}
+            };
+            options.Filter = new List<object>() {
+               new List<object>(){ "state", "=", 0},
+               "and",
+               new List<object>(){ "start_member_id", "=", ChatConfig.ClaimsInfo.OAMemberId },
+               "and",
+               new List<object>(){ nameof(formain_98007.field0004), "=", LoginUserSessionId },
+               "and",
+               new List<object>(){ nameof(formain_98007.field0008), "=", ServiceName },
+            };
+
+            var formain98007s = await _ossAgentService.GetTEntityDataListV2<formain_98007>(options);
+            if (formain98007s != null)
+            {
+                if (formain98007s.Count > 0)
+                {
+                    HistoryDataCount += formain98007s.Count;
+                    var oldChatData = new List<ChatMessage>();
+                    foreach (var formain98007 in formain98007s.OrderBy(o => o.start_date).ToList())
+                    {
+                        oldChatData.Add(new ChatMessage()
+                            {
+                                Sender = formain98007.start_member_name,
+                                UserType = "User",
+                                Content = formain98007.field0001,
+                                Time = Convert.ToDateTime(formain98007.start_date),
+                                GroupId = formain98007.field0003,
+                                SessionId = formain98007.field0004
+                            });
+                        oldChatData.Add(new ChatMessage()
+                            {
+                                Sender = "AI",
+                                UserType = "AI",
+                                ReplyContent = formain98007.field0002,
+                                ReplyTime = formain98007.field0009,
+                                GroupId = formain98007.field0003,
+                                asnwer_times = formain98007.field0006,
+                                SessionId = formain98007.field0004,
+                                IsFinish = true,
+                            });
+                    }
+                    ChatData.InsertRange(0, oldChatData);
+                    var visibleIndex = HistoryDataCount == formain98007s.Count ? oldChatData.Count : (oldChatData.Count - 1);
+                    AIListBox.MakeItemVisible(visibleIndex);
+                    //await AIListBox.MakeDataItemVisibleAsync(ChatData.LastOrDefault());
+                }
+                else
+                {
+                    NoLoadData = true;
+                }
+            }
+        }
+    }
+
+    bool IsLoadMoreData { get; set; } = false;
+
+    [JSInvokable]
+    public async Task LoadMoreData()
+    {
+        if (!NoLoadData)
+        {
+            try
+            {
+                IsLoadMoreData = true;
+                StateHasChanged();
+                await SetChatData();
+            }
+            catch { }
+            IsLoadMoreData = false;
+            StateHasChanged();
+        }
+    }
+    #endregion
+
+    #region 发送消息
+    int SendType = 0;
+    string SendText { get; set; }
+    bool IsSending { get; set; } = false;
+
+    public virtual async Task Send()
+    {
+        // 默认实现
+        try
+        {
+            //处理换行符
+            var message = SendText?.Trim().Replace("\n", "<br>");
+
+            //清空提问内容
+            SendText = string.Empty;
+
+            //没有提问内容或者提问按钮没有禁用
+            if (string.IsNullOrWhiteSpace(message) || IsSending)
+            {
+                return;
+            }
+            IsSending = true;
+            string groupId = Guid.NewGuid().ToString().Replace("-", "");
+            var chatDataQ = new ChatMessage()
+                {
+                    Sender = ChatConfig.ClaimsInfo.UserName,
+                    UserType = "User",
+                    Content = message,  //测试消息：scontrol如何查看正在运行的作业信息
+                    Time = DateTime.Now,
+                    GroupId = groupId,
+                    SessionId = LoginUserSessionId
+                };
+            ChatData.Add(chatDataQ);
+            var chatDataA = new ChatMessage()
+                {
+                    Sender = "AI",
+                    UserType = "AI",
+                    Time = DateTime.Now,
+                    GroupId = groupId,
+                    SessionId = LoginUserSessionId
+                };
+            ChatData.Add(chatDataA);
+            await AIListBox.MakeDataItemVisibleAsync(chatDataA);
+            AddChatLog(groupId, message);
+            sendMessageList.Add(new Message() { role = "user", content = message });
+            //发起OpenAI接口请求
+            openAIRequest.messages = sendMessageList;
+            var callBackModel = new CallBackModel() { GroupId = groupId, SessionId = LoginUserSessionId };
+            await _chatClient.GetAnswer(openAIRequest, callBackModel);
+        }
+        catch (Exception ex)
+        {
+            //_logger.LogError(ex, $"[发起提问] 保存数据报异常：{ex.Message}");
+            IsSending = false;
+        }
+    }
+
+    //快捷方式提问
+    private async Task OnKeyDown(KeyboardEventArgs e)
+    {
+
+        if (e.ShiftKey == false && e.Key == "Enter")
+        {
+            await Send();
+        }
+    }
+
+    #endregion
+
+    #region 无权限处理
+    async Task ApplyPermissionBotSend()
+    {
+        if (ChatConfig.OnNoAuth.HasDelegate)
+        {
+            await ChatConfig.OnNoAuth.InvokeAsync();
+        }
+        ToastService.ShowToast(new ToastOptions
+            {
+                ProviderName = "CustomToast",
+                Text = "申请已提交，请等通知!",
+                RenderStyle = ToastRenderStyle.Success
+            });
+    }
+    #endregion
+
+    #region 显示文本转换
+    //将内容转化成MarkDown格式输出
+    private MarkupString ConvertToMarkdown(string markdownData, string userType)
+    {
+        if (!string.IsNullOrEmpty(markdownData))
+        {
+            var builder = (new MarkdownPipelineBuilder());
+            builder.Extensions.Add(new PipeTableExtension());
+            var pipeline = builder.Build();
+
+            // markdown 转为 html
+            var htmlData = Markdown.ToHtml(markdownData, pipeline);
+
+            // 使用正则表达式替换所有图片链接
+            // htmlData = Regex.Replace(htmlData, @"<a href=""(https://[^""]+\.(?:png|jpg|jpeg|gif))"">([^<]+)</a>",
+            //     match => $"<a href=\"#\" onclick=\"ShowImageModal('{match.Groups[1].Value}')\">{match.Groups[2].Value}</a>");
+
+            // 使用正则表达式替换所有 img 标签
+            // htmlData = Regex.Replace(htmlData, @"<img src=""(https://[^""]+/([^""]+)\.(?:png|jpg|jpeg|gif))""[^>]*>",
+            //     match => $"<a href=\"#\" onclick=\"ShowImageModal('{match.Groups[1].Value}')\">{Path.GetFileNameWithoutExtension(match.Groups[2].Value)}</a>");
+
+            // 使用正则表达式替换所有图片链接
+            htmlData = Regex.Replace(htmlData, @"<a href=""(https://[^""]+\.(?:png|jpg|jpeg|gif))"">([^<]+)</a>",
+                match => $"<a href=\"{match.Groups[1].Value}\" target=\"_blank\">{match.Groups[2].Value}</a>");
+
+            // 使用正则表达式替换所有 img 标签
+            htmlData = Regex.Replace(htmlData, @"<img src=""(https://[^""]+/([^""]+)\.(?:png|jpg|jpeg|gif))""[^>]*>",
+                match => $"<a href=\"{match.Groups[1].Value}\" target=\"_blank\">{Path.GetFileNameWithoutExtension(match.Groups[2].Value)}</a>");
+
+            // 使用正则表达式替换所有 h1, h2, h3, h4, h5, h6 标签为 strong 标签
+            htmlData = Regex.Replace(htmlData, @"<h[1-6]>", "<strong>");
+            htmlData = Regex.Replace(htmlData, @"</h[1-6]>", "</strong>");
+
+            // 使用正则表达式替换表格标签增加自动行滚动
+            htmlData = Regex.Replace(htmlData, @"<table>", "<div style=\"overflow-x:auto;\"><table>");
+            htmlData = Regex.Replace(htmlData, @"</table>", "</table></div>");
+
+            // 将 普通文本 转为 可以渲染的html的类型
+            return (MarkupString)htmlData;
+        }
+
+        return (MarkupString)"";
+    }
+    #endregion
+
+    #region 快捷输入
+    private List<ChatToolbarItem> EmptyItems { get; set; } = new List<ChatToolbarItem>();
+    async Task EmptyItemClick(string text)
+    {
+        SendText = text;
+        await Send();
+    }
+    #endregion
+
+    #region 日志记录
+    //保存聊天内容
+    async Task AddChatLog(string groupId, string message)
+    {
+        try
+        {
+            //聊天内容保存到数据库
+            var dateTimeNow = DateTimeHelper.GetDateTime(DateTime.Now);
+            var newChatLogs = new formain_98007()
+                {
+                    field0004 = LoginUserSessionId,
+                    field0001 = message,
+                    field0003 = groupId,
+                    //field0007 = _userInitialState.IP,
+                    field0005 = ModelConfig.ModeName,
+                    // field0011 = SelectedModelType,
+                    // field0015 = chatTaskName,
+                    field0002 = "",
+                    field0012 = ModelConfig.ChatApi,
+                    field0009 = dateTimeNow,
+                    field0008 = ServiceName,
+                    state = 0,
+                    start_date = dateTimeNow,
+                    start_member_name = ChatConfig.ClaimsInfo.UserName,
+                    start_member_id = ChatConfig.ClaimsInfo.OAMemberId,
+                    modify_date = dateTimeNow,
+                    modify_member_name = ChatConfig.ClaimsInfo.UserName,
+                    modify_member_id = ChatConfig.ClaimsInfo.OAMemberId
+                };
+            await _ossAgentService.PostTEntityV2<formain_98007>(newChatLogs);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"[记录发送内容] 保存数据报异常：{ex.Message}  SessionId={LoginUserSessionId}  GroupId={groupId}");
+        }
+    }
+
+    public async Task UpdateChatLog(ChatMessage item)
+    {
+        //保存到数据库(回复内容、耗时)
+        try
+        {
+            var options = new DataSourceLoadOptionsBase();
+            options.Skip = 0;
+            options.Take = 1;
+            options.Filter = new List<object>() {
+                    new List<object>(){ nameof(formain_98007.field0003), "=", item.GroupId },
+                    "and",
+                    new List<object>(){ nameof(formain_98007.field0008), "=", ServiceName },
+                };
+
+            var formain98007s = await _ossAgentService.GetTEntityDataListV2<formain_98007>(options);
+
+            var info = formain98007s?.FirstOrDefault();
+            if (info != null)
+            {
+                info.field0002 = item.ReplyContent;
+                info.modify_member_name = ChatConfig.ClaimsInfo.UserName;
+                info.modify_member_id = ChatConfig.ClaimsInfo.OAMemberId;
+                info.field0006 = item.asnwer_times;
+                info.field0009 = DateTimeHelper.GetDateTime(item.ReplyTime.Value);
+                info.field0014 = item.content_references;
+
+                await _ossAgentService.PutTEntityV2<formain_98007>(info.ID.ToString(), info);
+            }
+            _logger.LogInformation($"将回复内容 保存到数据库。 SessionId={item.SessionId}  GroupId={item.GroupId}");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"[记录回复内容] 保存数据报异常：{ex.Message}  SessionId={item.SessionId}  GroupId={item.GroupId}");
+        }
+    }
+    #endregion
+
+    #region 样式动态获取
+    string getContetClass(string userType)
+    {
+        return userType == "AI" ? "chat-content-left" : "chat-content-right";
+    }
+
+    string getMessageClass(string userType)
+    {
+        return userType == "AI" ? "chat-message-left" : "chat-message-right";
+    }
+    #endregion
+
+    #region helpers
+    /// <summary>
+    /// 时间辅助类
+    /// </summary>
+    public static class DateTimeHelper
+    {
+
+        /// <summary>
+        /// 转化为UTC时间
+        /// </summary>
+        /// <param name="dateTime"></param>
+        /// <returns></returns>
+        public static DateTime GetDateTime(DateTime dateTime)
+        {
+            return dateTime.ToUniversalTime();
+        }
+
+        /// <summary>
+        /// 从UTC转化本地时间(默认加8小时)
+        /// </summary>
+        /// <param name="utcDateTime"></param>
+        /// <param name="format"></param>
+        /// <returns></returns>
+        public static string GetLocationDateTimeStr(IConfiguration config, DateTime? utcDateTime, string format = "yyyy-MM-dd HH:mm:ss")
+        {
+            return utcDateTime is null ? null : GetLocalDateTime(config, utcDateTime.Value).ToString(format);
+        }
+
+        public static DateTime GetLocalDateTime(IConfiguration configuration, DateTime utcDateTime)
+        {
+            return utcDateTime.ToLocalTime();
+        }
+    }
+
+    /// <summary>
+    /// 时间日期序列化
+    /// </summary>
+    public sealed class DateTimeConverter : IsoDateTimeConverter
+    {
+        /// <summary>
+        /// 构造函数
+        /// </summary>
+        /// <param name="format"></param>
+        public DateTimeConverter(string format) : base()
+        {
+            base.DateTimeFormat = format;
+        }
+    }
+
+    /// <inheritdoc />
+    /// <summary>
+    /// 大数据json序列化重写
+    /// </summary>
+    public sealed class NumberConverter : Newtonsoft.Json.JsonConverter
+    {
+        /// <summary>
+        /// 转换成字符串的类型
+        /// </summary>
+        private readonly NumberConverterShip _ship;
+
+        /// <summary>
+        /// 大数据json序列化重写实例化
+        /// </summary>
+        public NumberConverter()
+        {
+            _ship = (NumberConverterShip)0xFF;
+        }
+
+        /// <summary>
+        /// 大数据json序列化重写实例化
+        /// </summary>
+        /// <param name="ship">转换成字符串的类型</param>
+        public NumberConverter(NumberConverterShip ship)
+        {
+            _ship = ship;
+        }
+
+        /// <inheritdoc />
+        /// <summary>
+        /// 确定此实例是否可以转换指定的对象类型。
+        /// </summary>
+        /// <param name="objectType">对象的类型。</param>
+        /// <returns>如果此实例可以转换指定的对象类型，则为：<c>true</c>，否则为：<c>false</c></returns>
+        public override bool CanConvert(Type objectType)
+        {
+            var typecode = Type.GetTypeCode(objectType.Name.Equals("Nullable`1") ? objectType.GetGenericArguments().First() : objectType);
+            switch (typecode)
+            {
+                case TypeCode.Decimal:
+                    return (_ship & NumberConverterShip.Decimal) == NumberConverterShip.Decimal;
+                case TypeCode.Double:
+                    return (_ship & NumberConverterShip.Double) == NumberConverterShip.Double;
+                case TypeCode.Int64:
+                    return (_ship & NumberConverterShip.Int64) == NumberConverterShip.Int64;
+                case TypeCode.UInt64:
+                    return (_ship & NumberConverterShip.UInt64) == NumberConverterShip.UInt64;
+                case TypeCode.Single:
+                    return (_ship & NumberConverterShip.Single) == NumberConverterShip.Single;
+                default: return false;
+            }
+        }
+
+        /// <inheritdoc />
+        /// <summary>
+        /// 读取对象的JSON表示。
+        /// </summary>
+        /// <param name="reader">从 <see cref="T:Newtonsoft.Json.JsonReader" /> 中读取。</param>
+        /// <param name="objectType">对象的类型。</param>
+        /// <param name="existingValue">正在读取的对象的现有值。</param>
+        /// <param name="serializer">调用的序列化器实例。</param>
+        /// <returns>对象值。</returns>
+        public override object ReadJson(JsonReader reader, Type objectType, object existingValue, JsonSerializer serializer)
+        {
+            return AsType(reader.Value != null ? reader.Value.ToString() : "", objectType);
+        }
+
+        /// <summary>
+        /// 字符串格式数据转其他类型数据
+        /// </summary>
+        /// <param name="input">输入的字符串</param>
+        /// <param name="destinationType">目标格式</param>
+        /// <returns>转换结果</returns>
+        public static object AsType(string input, Type destinationType)
+        {
+            try
+            {
+                var converter = TypeDescriptor.GetConverter(destinationType);
+                if (converter.CanConvertFrom(typeof(string)))
+                {
+                    return converter.ConvertFrom(null, null, input);
+                }
+
+                converter = TypeDescriptor.GetConverter(typeof(string));
+                if (converter.CanConvertTo(destinationType))
+                {
+                    return converter.ConvertTo(null, null, input, destinationType);
+                }
+            }
+            catch
+            {
+                return null;
+            }
+            return null;
+        }
+
+        /// <inheritdoc />
+        /// <summary>
+        /// 写入对象的JSON表示形式。
+        /// </summary>
+        /// <param name="writer">要写入的 <see cref="T:Newtonsoft.Json.JsonWriter" /> 。</param>
+        /// <param name="value">要写入对象值</param>
+        /// <param name="serializer">调用的序列化器实例。</param>
+        public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
+        {
+            if (value == null)
+            {
+                writer.WriteNull();
+            }
+            else
+            {
+                var objectType = value.GetType();
+                var typeCode = Type.GetTypeCode(objectType.Name.Equals("Nullable`1") ? objectType.GetGenericArguments().First() : objectType);
+                switch (typeCode)
+                {
+                    case TypeCode.Decimal:
+                        writer.WriteValue(((decimal)value).ToString("f6"));
+                        break;
+                    case TypeCode.Double:
+                        writer.WriteValue(((double)value).ToString("f4"));
+                        break;
+                    case TypeCode.Single:
+                        writer.WriteValue(((float)value).ToString("f2"));
+                        break;
+                    default:
+                        writer.WriteValue(value.ToString());
+                        break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 转换成字符串的类型
+    /// </summary>
+    [Flags]
+    public enum NumberConverterShip
+    {
+        /// <summary>
+        /// 长整数
+        /// </summary>
+        Int64 = 1,
+
+        /// <summary>
+        /// 无符号长整数
+        /// </summary>
+        UInt64 = 2,
+
+        /// <summary>
+        /// 浮点数
+        /// </summary>
+        Single = 4,
+
+        /// <summary>
+        /// 双精度浮点数
+        /// </summary>
+        Double = 8,
+
+        /// <summary>
+        /// 大数字
+        /// </summary>
+        Decimal = 16
+    }
+
+    public static class StrSubstitution
+    {
+        public static string FormatPhone(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            { return value; }
+            else
+            {
+                //if (value.Length < 6)
+                //{
+                //    return value.Substring(0, value.Length - 3) + "***";
+                //}
+                //else
+                //{
+                //    return value.Substring(0, value.Length - 5) + "*****";
+                //}
+                if (value.Length > 6)
+                {
+                    return value.Substring(0, value.Length - 5) + "*****";
+                }
+                else
+                {
+                    return value;
+                }
+            }
+
+        }
+        public static string FormatEmail(string value)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(value))
+                {
+                    var tagIndex = value.IndexOf("@");
+                    if (tagIndex == -1)
+                    {
+                        return FormatPhone(value);
+                    }
+                    else
+                    {
+                        if (value.Contains("@paratera.com") || value.Contains("@blsc.cn"))
+                        {
+                            return value;
+                        }
+                        else
+                        {
+                            return value.Substring(0, tagIndex - 1) + "**@*******";
+                        }
+
+                    }
+                }
+                else
+                {
+                    return value;
+                }
+            }
+            catch (Exception ex)
+            {
+                return "";
+            }
+        }
+
+        public static string FormatAmount(object value)
+        {
+            if (value != null && string.IsNullOrEmpty(value.ToString()))
+                return "0";
+            else
+                return Convert.ToDecimal(value).ToString("#,##0.00");
+        }
+        /// <summary>
+        /// 写个校验是否手机号码的方法
+        /// </summary>
+        /// <param name="value"></param>
+        /// <returns></returns>
+        public static bool IsMobilePhone(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return false;
+            }
+            else
+            {
+                return System.Text.RegularExpressions.Regex.IsMatch(value, @"^1[3-9]\d{9}$");
+            }
+        }
+    }
+    #endregion
+
+    #region models   
+
+    public class ChatMessage
+    {
+        /// <summary>
+        /// 提问用户名
+        /// </summary>
+        public string? Sender { get; set; }
+
+        /// <summary>
+        /// 提问内容
+        /// </summary>
+        public string? Content { get; set; }
+
+        /// <summary>
+        /// 类型 机器人，用户
+        /// </summary>
+        public string? UserType { get; set; }
+
+        /// <summary>
+        /// 提问时间
+        /// </summary>
+        public DateTime Time { get; set; } = DateTime.Now;
+
+        /// <summary>
+        /// 回复内容
+        /// </summary>
+        public string? ReplyContent { get; set; }
+
+        /// <summary>
+        /// 回复时间
+        /// </summary>
+        public DateTime? ReplyTime { get; set; } = DateTime.Now;
+
+        /// <summary>
+        /// 回复用户名
+        /// </summary>
+        public string? ReplySender { get; set; }
+
+        /// <summary>
+        /// 分组编号
+        /// </summary>
+        public string GroupId { get; set; }
+
+        /// <summary>
+        /// 会话ID
+        /// </summary>
+        public string? SessionId { get; set; }
+
+        /// <summary>
+        /// 答复耗时(秒)
+        /// </summary>
+        public double? asnwer_times { get; set; } = 0;
+
+        /// <summary>
+        /// 是否推荐
+        /// </summary>
+        public string? recommend { get; set; }
+
+        /// <summary>
+        /// 引用
+        /// </summary>
+        public string? content_references { get; set; }
+
+        /// <summary>
+        /// 已完成输出
+        /// </summary>
+        public bool IsFinish { get; set; } = false;
+
+
+        /// <summary>
+        /// 任务类型名称
+        /// </summary>
+        public string? ChatTaskName { get; set; }
+    }
+
+    #region AI提问请求
+    public class OpenAIRequest
+    {
+        ///// <summary>
+        ///// -2.0 和 2.0 之间的数字。正值会根据新标记在文本中的现有频率对其进行惩罚，从而降低模型逐字重复同一行的可能性。
+        ///// [查看有关频率和存在惩罚的更多信息。](https://platform.openai.com/docs/api-reference/parameter-details)
+        ///// </summary>
+        //[JsonProperty("frequency_penalty", NullValueHandling = NullValueHandling.Ignore)]
+        //public double? FrequencyPenalty { get; set; }
+
+        ///// <summary>
+        ///// 修改指定标记出现在完成中的可能性。  接受一个 json 对象，该对象将标记（由标记器中的标记 ID 指定）映射到从 -100 到 100
+        ///// 的关联偏差值。从数学上讲，偏差会在采样之前添加到模型生成的 logits 中。确切的效果因模型而异，但 -1 和 1 之间的值应该会减少或增加选择的可能性；像 -100 或
+        ///// 100 这样的值应该导致相关令牌的禁止或独占选择。
+        ///// </summary>
+        //[JsonProperty("logit_bias")]
+        //public object LogitBias { get; set; }
+
+        /// <summary>
+        /// 聊天完成时生成的最大令牌数。  输入标记和生成标记的总长度受模型上下文长度的限制。
+        /// </summary>
+        [JsonPropertyName("max_tokens")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public int? max_tokens { get; set; }
+
+        /// <summary>
+        /// 以[聊天格式](https://platform.openai.com/docs/guides/chat/introduction)生成聊天完成的消息。
+        /// </summary>
+        [JsonPropertyName("messages")]
+        public List<Message> messages { get; set; }
+
+        /// <summary>
+        /// 要使用的模型的 ID。有关哪些模型适用于聊天 API
+        /// 的详细信息，请参阅[模型端点兼容性表。](https://platform.openai.com/docs/models/model-endpoint-compatibility)
+        /// </summary>
+        [JsonPropertyName("model")]
+        public string model { get; set; }
+
+        ///// <summary>
+        ///// 为每个输入消息生成多少个聊天完成选项。
+        ///// </summary>
+        //[JsonProperty("n", NullValueHandling = NullValueHandling.Ignore)]
+        //public long? N { get; set; }
+
+        ///// <summary>
+        ///// -2.0 和 2.0 之间的数字。正值会根据到目前为止是否出现在文本中来惩罚新标记，从而增加模型谈论新主题的可能性。
+        ///// [查看有关频率和存在惩罚的更多信息。](https://platform.openai.com/docs/api-reference/parameter-details)
+        ///// </summary>
+        //[JsonProperty("presence_penalty", NullValueHandling = NullValueHandling.Ignore)]
+        //public double? PresencePenalty { get; set; }
+
+        ///// <summary>
+        ///// API 将停止生成更多令牌的最多 4 个序列。
+        ///// </summary>
+        //[JsonProperty("stop", NullValueHandling = NullValueHandling.Ignore)]
+        //public string Stop { get; set; }
+
+        /// <summary>
+        /// 如果设置，将发送部分消息增量，就像在 ChatGPT
+        /// 中一样。当令牌可用时，令牌将作为纯数据[服务器发送事件](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#Event_stream_format)`data:
+        /// [DONE]`发送，流由消息终止。[有关示例代码](https://github.com/openai/openai-cookbook/blob/main/examples/How_to_stream_completions.ipynb)，请参阅
+        /// OpenAI Cookbook 。
+        /// </summary>      
+        [JsonPropertyName("stream")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public bool? stream { get; set; }
+
+        /// <summary>
+        /// 使用什么采样温度，介于 0 和 2 之间。较高的值（如 0.8）将使输出更加随机，而较低的值（如 0.2）将使输出更加集中和确定。
+        /// 我们通常建议改变这个或`top_p`但不是两者。
+        /// </summary>
+        [JsonPropertyName("temperature")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public decimal? temperature { get; set; }
+
+        /// <summary>
+        /// 一种替代温度采样的方法，称为核采样，其中模型考虑具有 top_p 概率质量的标记的结果。所以 0.1 意味着只考虑构成前 10% 概率质量的标记。
+        /// 我们通常建议改变这个或`temperature`但不是两者。
+        /// </summary>
+        [JsonPropertyName("top_p")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public decimal? top_p { get; set; }
+
+        ///// <summary>
+        ///// 代表您的最终用户的唯一标识符，可以帮助 OpenAI
+        ///// 监控和检测滥用行为。[了解更多](https://platform.openai.com/docs/guides/safety-best-practices/end-user-ids)。
+        ///// </summary>
+        //[JsonProperty("user", NullValueHandling = NullValueHandling.Ignore)]
+        //public string User { get; set; }
+
+
+        #region 自定义参数
+
+        /// <summary>
+        /// 联网搜索
+        /// </summary>
+        public bool? online { get; set; } = false;
+
+        #endregion
+    }
+
+    public class Message
+    {
+        [JsonPropertyName("content")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? content { get; set; }
+
+        [JsonPropertyName("role")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? role { get; set; }
+    }
+    #endregion
+
+
+    public class ChatBaseConfig
+    {
+        public string ServiceName { get; set; } = "ChatBase";
+        /// <summary>
+        /// 无数据显示快捷提问列表
+        /// </summary>
+        public List<string> EmptyQuickQuestions { get; set; } = new List<string>();
+        /// <summary>
+        /// 是否获取历史数据
+        /// </summary>
+        public bool EnableHistoryData { get; set; } = false;
+        /// <summary>
+        /// 登录用户信息
+        /// </summary>
+        public ClaimInfo ClaimsInfo { get; set; } = new ClaimInfo()
+            {
+                WXUserId = "user",
+                OAMemberId = "user",
+                UserName = "用户"
+            };
+        /// <summary>
+        /// 无权限认证事件
+        /// </summary>
+        public EventCallback OnNoAuth { get; set; }
+        /// <summary>
+        /// 聊天后端服务域名
+        /// </summary>
+        public string ChatServiceApi { get; set; }
+        /// <summary>
+        /// 聊天后端服务认证token
+        /// </summary>
+        public string ChatServiceToken { get; set; }
+        /// <summary>
+        /// 聊天后端服务是否使用用户token
+        /// </summary>
+        public bool ChatUseUserToken { get; set; } = false;
+        /// <summary>
+        /// openAI模型配置
+        /// </summary>
+        public ChatModelConfig ModelConfig { get; set; }
+    }
+
+    /// <summary>
+    /// Chat模式配置
+    /// </summary>
+    public class ChatModelConfig
+    {
+        /// <summary>
+        /// 产品名称
+        /// </summary>
+        public string? ProductName { get; set; }
+
+        /// <summary>
+        /// 接口地址
+        /// </summary>
+        public string? ChatApi { get; set; }
+
+        /// <summary>
+        /// 模式名称
+        /// </summary>
+        public string? ModeName { get; set; }
+
+        /// <summary>
+        /// 请求凭证
+        /// </summary>
+        public string? Token { get; set; }
+
+        /// <summary>
+        /// 默认使用
+        /// </summary>
+        public bool IsDefault { get; set; } = false;
+
+        /// <summary>
+        /// 是流式输出
+        /// </summary>
+        public bool IsStream { get; set; } = false;
+
+        /// <summary>
+        /// 开启
+        /// </summary>
+        public bool IsEnable { get; set; } = false;
+
+        /// <summary>
+        /// 模型名称(大模型，本地库  )
+        /// </summary>
+        public string? ModelType { get; set; }
+
+        /// <summary>
+        /// 最大tokens数量
+        /// </summary>
+        public int MaxTokens { get; set; }
+        /// <summary>
+        /// 设置多轮对话数（0 为单轮）
+        /// </summary>
+        public int MutilAnswerNum { get; set; }
+
+        /// <summary>
+        /// 启用联网功能
+        /// </summary>
+        public bool Online { get; set; }
+    }
+
+    /// <summary>
+    /// AIChat自定义的回调模型
+    /// </summary>
+    public class CallBackModel
+    {
+        public string? SessionId { get; set; }
+        public string? GroupId { get; set; }
+        public string? Message { get; set; }
+        public string? ContentReferences { get; set; }
+    }
+
+    public class BaseModel
+    {
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+        [Newtonsoft.Json.JsonConverter(typeof(NumberConverter), NumberConverterShip.Int64)]
+        [Display(Name = "ID")]
+        public long ID { get; set; }
+        /// <summary>
+        /// 状态   删除标记： 1删除    0或者null正常
+        /// </summary>
+        [Display(Name = "状态")]
+        public int? state { get; set; }
+        /// <summary>
+        /// 发起人id
+        /// </summary>
+        public string start_member_id { get; set; }
+        /// <summary>
+        /// 发起人姓名
+        /// </summary>
+        public string start_member_name { get; set; }
+        /// <summary>
+        /// 发起时间
+        /// </summary>
+        [Display(Name = "发起时间")]
+        public DateTime? start_date { get; set; }
+        /// <summary>
+        /// 审批人ID
+        /// </summary>
+        public string approve_member_id { get; set; }
+        /// <summary>
+        /// 审批人姓名
+        /// </summary>
+        public string approve_member_name { get; set; }
+        public DateTime? approve_date { get; set; }
+        /// <summary>
+        /// 完成标识（表示整个数据不会再做变更）
+        /// </summary>
+        [Display(Name = "完成标识")]
+        public int? finishedflag { get; set; } = 0;
+        /// <summary>
+        /// 批准标识
+        /// </summary>
+        public int? ratifyflag { get; set; }
+        /// <summary>
+        /// 批准人ID
+        /// </summary>
+        public string ratify_member_id { get; set; }
+        /// <summary>
+        /// 批准人姓名
+        /// </summary>
+        public string ratify_member_name { get; set; }
+        /// <summary>
+        /// 批准时间
+        /// </summary>
+        public DateTime? ratify_date { get; set; }
+        /// <summary>
+        /// 排序
+        /// </summary>
+        public int? sort { get; set; }
+        /// <summary>
+        /// 更新人ID
+        /// </summary>
+        public string modify_member_id { get; set; }
+        /// <summary>
+        /// 更新人姓名
+        /// </summary>
+        public string modify_member_name { get; set; }
+        /// <summary>
+        /// 更新时间
+        /// </summary>
+        [Display(Name = "更新时间")]
+        [DisplayFormat(DataFormatString = "yyyy-MM-dd HH:mm:ss")]
+        public DateTime? modify_date { get; set; }
+
+
+    }
+
+    public class DevResponseDto<T>
+    {
+        public List<T> data { get; set; }
+
+        public int totalCount { get; set; }
+
+        public int groupCount { get; set; }
+
+        public List<int> summary { get; set; }
+    }
+
+    /// <summary>
+    /// 聊天内容历史表  ChatLogs 改为 formain_98007
+    /// </summary>
+    [Table("formain_98007")]
+    public class formain_98007 : BaseModel
+    {
+
+        /// <summary>
+        /// 提问
+        /// </summary>
+        public string? field0001 { get; set; }
+
+
+        /// <summary>
+        /// 回答
+        /// </summary>
+        public string? field0002 { get; set; }
+
+
+        /// <summary>
+        /// 问题编号
+        /// </summary>
+        public string? field0003 { get; set; }
+
+        /// <summary>
+        /// 会话标识
+        /// </summary>
+        public string? field0004 { get; set; }
+
+        /// <summary>
+        /// 模式名称或知识库名
+        /// </summary>
+        public string? field0005 { get; set; }
+
+        /// <summary>
+        /// 答复耗时(秒)
+        /// </summary>
+        public double? field0006 { get; set; } = 0;
+
+        /// <summary>
+        /// 当前登录用户IP
+        /// </summary>
+        public string? field0007 { get; set; }
+
+        /// <summary>
+        /// 所属服务
+        /// </summary>
+        public string? field0008 { get; set; }
+
+
+        /// <summary>
+        /// 回复时间
+        /// </summary>
+        public DateTime? field0009 { get; set; }
+
+
+        /// <summary>
+        /// 是否推荐
+        /// </summary>
+        public string? field0010 { get; set; }
+
+        /// <summary>
+        /// 问答模式(大模型、并行知识库)
+        /// </summary>
+        public string? field0011 { get; set; }
+
+        /// <summary>
+        /// 问答接口地址
+        /// </summary>
+        public string? field0012 { get; set; }
+
+
+        /// <summary>
+        /// 标记为猜你所想
+        /// </summary>
+        public int? field0013 { get; set; }
+
+        /// <summary>
+        /// 内容引用
+        /// </summary>
+        public string? field0014 { get; set; }
+
+
+        /// <summary>
+        /// 知识库别称
+        /// </summary>
+        public string? field0015 { get; set; }
+    }
+
+    public class ChatToolbarItem
+    {
+        public string Text { get; set; }
+        public bool Checked { get; set; }
+        public bool BeginGroup { get; set; }
+        public string IconCss { get; set; }
+        public bool SplitMenuButton { get; set; }
+        public string Category { get; set; }
+        public string Tooltip { get; set; }
+    }
+
+    public class AIBotMsg
+    {
+        public string msgId { get; set; }
+        public string msgContent { get; set; }
+        public long timestamp { get; set; }
+    }
+
+    public class OpenAIOKResponse
+    {
+        [JsonPropertyName("choices")]
+        public List<Choice>? Choices { get; set; }
+
+        [JsonPropertyName("created")]
+        public long Created { get; set; }
+
+        [JsonPropertyName("id")]
+        public string? Id { get; set; }
+
+        [JsonPropertyName("object")]
+        public string? Object { get; set; }
+
+        [JsonPropertyName("usage")]
+        public Usage? Usage { get; set; }
+
+        [JsonPropertyName("references")]
+        public List<ContentReferences>? References { get; set; }
+    }
+
+    public class OpenAIErrorResponse
+    {
+        [JsonPropertyName("error")]
+        public Error? Error { get; set; }
+    }
+
+    public class Error
+    {
+        [JsonPropertyName("message")]
+        public string Message { get; set; }
+
+        [JsonPropertyName("type")]
+        public string Type { get; set; }
+
+        [JsonPropertyName("code")]
+        public string Code { get; set; }
+
+        [JsonPropertyName("param")]
+        public object Param { get; set; }
+    }
+
+    public class Choice
+    {
+        [JsonPropertyName("finish_reason")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string FinishReason { get; set; }
+
+        [JsonPropertyName("index")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public long? Index { get; set; }
+
+        [JsonPropertyName("message")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public Message Message { get; set; }
+
+        [JsonPropertyName("delta")]
+        [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public Message? Delta { get; set; }
+
+    }
+
+    public class Usage
+    {
+        [JsonPropertyName("completion_tokens")]
+        public long CompletionTokens { get; set; }
+
+        [JsonPropertyName("prompt_tokens")]
+        public long PromptTokens { get; set; }
+
+        [JsonPropertyName("total_tokens")]
+        public long TotalTokens { get; set; }
+    }
+
+    public class ContentReferences
+    {
+        public string? file { get; set; }
+        public int? page { get; set; }
+        public string? heading { get; set; }
+    }
+
+    public class EventSource : IDisposable
+    {
+        public delegate void OnOpenEventHandler(object sender);
+        public delegate void OnEventHandler(object sender, OnEventArgs e);
+        public delegate void OnErrorEventHandler(object sender, Exception e);
+        public delegate void OnCloseEventHandler(object sender);
+
+        public event OnOpenEventHandler? OnOpenEvent;
+        public event OnEventHandler? OnEvent;
+        public event OnErrorEventHandler? OnErrorEvent;
+        public event OnCloseEventHandler? OnCloseEvent;
+
+        private readonly HttpClient client;
+        private readonly string url;
+        private HttpMethod? method;
+        private readonly HttpContent? content;
+        private AuthenticationHeaderValue? authorization;
+        public AuthenticationHeaderValue? Authorization { set { authorization = value; } }
+
+        private bool isDisposed = false;
+        private volatile bool isReading = false;
+        private readonly object startLock = new();
+
+        public EventSource(string url, HttpClient client)
+        {
+            this.url = url;
+            this.client = client;
+        }
+
+        public EventSource(string url, HttpClient client, HttpMethod? method) : this(url, client)
+        {
+            this.method = method;
+        }
+
+        public EventSource(string url, HttpClient client, HttpMethod? method, AuthenticationHeaderValue? authorization) : this(url, client, method)
+        {
+            this.authorization = authorization;
+        }
+
+        public EventSource(string url, HttpClient client, HttpMethod? method, AuthenticationHeaderValue? authorization, HttpContent? content) : this(url, client, method, authorization)
+        {
+            this.content = content;
+        }
+
+        public bool Open()
+        {
+            return Open(content);
+        }
+
+        public bool Open(HttpContent? content)
+        {
+            if (isDisposed)
+            {
+                return false;
+            }
+            lock (startLock)
+            {
+                if (isReading == false)
+                {
+                    isReading = true;
+                    _ = StartAsync(content, authorization);
+                }
+            }
+            return true;
+        }
+
+        public void Close()
+        {
+            isReading = false;
+        }
+
+        public bool IsClosed()
+        {
+            return isReading == false;
+        }
+
+        public void Dispose()
+        {
+            Close();
+            isDisposed = true;
+        }
+
+        private async Task StartAsync(HttpContent? content, AuthenticationHeaderValue? authorization)
+        {
+            if (method == null)
+            {
+                method = HttpMethod.Get;
+            }
+            var request = new HttpRequestMessage(method, url);
+            if (content != null)
+            {
+                request.Content = content;
+            }
+            if (authorization != null)
+            {
+                request.Headers.Authorization = authorization;
+            }
+            Stream? stream = null;
+            try
+            {
+                using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                response.EnsureSuccessStatusCode();
+                OnOpenEvent?.Invoke(this);
+
+                if (response.Headers.TryGetValues("content-type", out IEnumerable<string>? contentTypes) &&
+                    contentTypes.Contains("text/event-stream") == false)
+                {
+                    throw new ArgumentException("接口类型错误");
+                }
+
+                stream = await response.Content.ReadAsStreamAsync();
+                using var reader = new StreamReader(stream);
+
+                string type = "message";
+                string id = string.Empty;
+                var data = new StringBuilder(string.Empty);
+                int blanksCount = 0;
+                bool isEnd = false; //标识正常结束
+                while (isReading)
+                {
+                    string? line = await reader.ReadLineAsync();
+                    if (reader.EndOfStream)
+                    {
+                        isEnd = true;
+
+                        //特殊处理  data: [DONE]
+                        if (line == "data: [DONE]")
+                        {
+                            data.Append("[DONE]");
+                        }
+
+                        if (!isReading)
+                        {
+                            // 如果 isReading 为 false，跳出循环
+                            break;
+                        }
+
+                        if (data.Length > 0)
+                        {
+                            var text = data.Replace("\n\n", "\n").ToString();
+                            await Task.Delay(3);
+                            OnEvent?.Invoke(this, new OnEventArgs(text, type, id));
+                        }
+                        break;
+                    }
+                    if (string.IsNullOrEmpty(line))
+                    {
+                        // 双换行
+                        if (data.Length > 0)
+                        {
+                            var text = data.Replace("\n\n", "\n").ToString();
+                            await Task.Delay(3);
+                            OnEvent?.Invoke(this, new OnEventArgs(text, type, id));
+                        }
+                        data.Clear();
+                        id = string.Empty;
+                        type = "message";
+                        continue;
+                    }
+                    else if (line.First() == ':')
+                    {
+                        // 忽略备注
+                        continue;
+                    }
+
+                    string messageType;
+                    int index = line.IndexOf(':');
+                    if (index == -1)
+                    {
+                        messageType = line;
+                        index = line.Length;
+                    }
+                    else
+                    {
+                        messageType = line[..index];
+                        index += 2;
+                    }
+
+                    string value = line[index..];
+                    switch (messageType)
+                    {
+                        case "event":
+                            type = value;
+                            break;
+                        case "data":
+                            if (value == "")
+                            {
+                                blanksCount++;
+                                if (blanksCount == 2)
+                                {
+                                    blanksCount = 0;
+                                    value = "\n";
+                                }
+                            }
+                            else
+                            {
+                                blanksCount = 0;
+                            }
+                            data.Append(value);
+                            break;
+                        case "retry":
+                            break;
+                        case "id":
+                            id = value;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+
+                if (isEnd && data.Length == 0)
+                {
+                    throw new Exception($"数据为空");
+                }
+
+            }
+            catch (HttpRequestException e)
+            {
+                OnErrorEvent?.Invoke(this, e);
+            }
+            catch (Exception e)
+            {
+                OnErrorEvent?.Invoke(this, e);
+            }
+            finally
+            {
+                isReading = false;
+                stream?.Dispose();
+                try
+                {
+                    OnCloseEvent?.Invoke(this);
+                }
+                catch (Exception) { }
+            }
+        }
+    }
+
+    public class OnEventArgs
+    {
+        public string Id { get; private set; }
+
+        public string Event { get; private set; }
+
+        public string Message { get; private set; }
+
+        public OnEventArgs(string data, string type, string id)
+        {
+            Message = data;
+            Event = type;
+            Id = id;
+        }
+    }
+    #endregion
+
+    #region services
+    #region openAI请求
+    public class ChatClient : BaseClient
+    {
+        public delegate void OnWaitEventHandler(object sender, CallBackModel data);
+        public delegate void OnStartEventHandler(object sender, CallBackModel data);
+        public delegate void OnMessageEventHandler(object sender, CallBackModel data);
+        public delegate void OnErrorEventHandler(object sender, Exception e, CallBackModel data);
+        public delegate void OnFinishEventHandler(object sender, CallBackModel data);
+
+        public event OnWaitEventHandler? OnWaitEvent;
+        public event OnStartEventHandler? OnStartEvent;
+        public event OnMessageEventHandler? OnMessage;
+        public event OnErrorEventHandler? OnErrorEvent;
+        public event OnFinishEventHandler? OnFinishEvent;
+
+
+        /// <summary>
+        ///
+        /// </summary>
+        /// <param name="logger"></param>
+        /// <param name="httpClientFactory"></param>
+        public ChatClient(ILogger<ChatClient> logger, IHttpClientFactory httpClientFactory) :
+            base(logger, nameof(ChatClient), httpClientFactory)
+        {
+
+        }
+
+        /// <summary>
+        /// 设置请求接口
+        /// </summary>
+        public string? ChatApi { get; set; }
+
+        /// <summary>
+        /// 设置是否流式输出
+        /// </summary>
+        public bool Stream { get; set; }
+
+        /// <summary>
+        /// 问题内容的最大长度
+        /// </summary>
+        public int MaxTextLength { get; set; } = 2048;
+
+        /// <summary>
+        /// 验证设置
+        /// </summary>
+        public AuthenticationHeaderValue? Authentication { get; set; }
+
+        /// <summary>
+        /// 获取回复
+        /// </summary>
+        /// <returns></returns>
+        public async Task GetAnswer(OpenAIRequest data, CallBackModel callBackData)
+        {
+            OnWaitEvent?.Invoke(this, callBackData);
+            //var totalContent = 0;
+            //if (data.Messages.Any())
+            //{
+            //    data.Messages.ForEach(n => totalContent += n.Content.Length);
+            //}
+            //if (totalContent > MaxTextLength)
+            //{
+            //    OnErrorEvent?.Invoke(this, new Exception("内容过多"), callBackData);
+            //    OnFinishEvent?.Invoke(this, callBackData);
+            //    return;
+            //}
+
+            //重置为可以输出
+            ResumeStreaming();
+
+            if (Stream)
+            {
+                GetStreamAnswer(data, callBackData);
+                return;
+            }
+            await GetStringAnswer(data, callBackData);
+        }
+
+        /// <summary>
+        /// 获取非流式回复
+        /// </summary>
+        /// <param name="data"></param>
+        /// <returns></returns>
+        private async Task GetStringAnswer(OpenAIRequest data, CallBackModel callBackData)
+        {
+            string? result;
+            try
+            {
+                using var client = CreateHttpClient();
+                client.DefaultRequestHeaders.Add("Accept", "application/json");
+                client.Timeout = TimeSpan.FromMinutes(5);
+
+                if (Authentication != null)
+                {
+                    client.DefaultRequestHeaders.Authorization = Authentication;
+                }
+
+                OnStartEvent?.Invoke(this, callBackData);
+                var response = await client.PostAsync(ChatApi, new StringContent(System.Text.Json.JsonSerializer.Serialize(data), Encoding.UTF8, MediaTypeNames.Application.Json));
+
+                result = await response.Content.ReadAsStringAsync();
+
+
+                _logger.LogInformation($"SessionId={callBackData.SessionId}  提问：{data.messages[0].content} | {ChatApi} 返回：{(int)response.StatusCode} | {result}");
+
+
+                if (string.IsNullOrEmpty(result))
+                {
+                    OnErrorEvent?.Invoke(this, new Exception("未返回结果"), callBackData);
+                    return;
+                }
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var answer = "";
+                    var promptResult = JsonConvert.DeserializeObject<OpenAIOKResponse>(result);
+                    if (promptResult != null && promptResult.Choices.Any())
+                    {
+                        promptResult.Choices.ForEach(n =>
+                        {
+                            answer += n.Message.content;
+                        });
+                    }
+                    else
+                    {
+                        answer = "请求失败，请重试[2001]";
+                    }
+
+                    callBackData.Message = answer;
+                    OnMessage?.Invoke(this, callBackData);
+                }
+                else
+                {
+                    var answer = "请求失败，请重试[2002]";
+                    var promptResult = JsonConvert.DeserializeObject<OpenAIErrorResponse>(result);
+                    if (promptResult != null && promptResult.Error != null)
+                    {
+                        answer = promptResult.Error.Message;
+                    }
+
+                    OnErrorEvent?.Invoke(this, new Exception(answer), callBackData);
+                }
+            }
+            catch (HttpRequestException e)
+            {
+                _logger.LogError(e, $"SessionId={callBackData.SessionId}  提问：{data.messages[0].content} | {ChatApi} [2003]报错：{e.Message}");
+
+                try
+                {
+                    OnErrorEvent?.Invoke(this, new Exception("请求失败，请重试[2003]"), callBackData);
+                }
+                catch (Exception) { }
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, $"SessionId={callBackData.SessionId}  提问：{data.messages[0].content} | {ChatApi} [2004]报错：{e.Message}");
+
+                try
+                {
+                    if (e.Message.Contains("401") || e.Message.Contains("403")) //无权限
+                    {
+                        OnErrorEvent.Invoke(this, new Exception("暂未开通AI助手功能"), callBackData);
+                    }
+                    else
+                    {
+                        OnErrorEvent.Invoke(this, new Exception("请求失败，请重试[2004]"), callBackData);
+                    }
+                }
+                catch (Exception) { }
+            }
+            finally
+            {
+                OnFinishEvent?.Invoke(this, callBackData);
+            }
+        }
+
+        /// <summary>
+        /// 获取流式回复
+        /// </summary>
+        /// <returns></returns>
+        private void GetStreamAnswer(OpenAIRequest data, CallBackModel callBackData)
+        {
+            var client = CreateHttpClient();
+            client.Timeout = TimeSpan.FromMinutes(5);
+
+            var content = new StringContent(System.Text.Json.JsonSerializer.Serialize(data), Encoding.UTF8, MediaTypeNames.Application.Json);
+
+            var eventSource = new EventSource(ChatApi, client, HttpMethod.Post, Authentication, content);
+            if (OnStartEvent != null)
+            {
+                eventSource.OnOpenEvent += delegate (object sender)
+                {
+                    OnStartEvent.Invoke(this, callBackData);
+                };
+            }
+            eventSource.OnEvent += delegate (object sender, OnEventArgs e)
+            {
+                //_logger.LogInformation($"SessionId={callBackData.SessionId}  提问：{data.Messages[0].Content} | {ChatApi} 返回：{e.Message}");
+
+                if (shouldPause)
+                {
+                    // 如果暂停，不处理事件
+                    // _logger.LogInformation("暂停流式输出");
+
+                    eventSource.Close();
+                    return;
+                }
+
+                //结束
+                if (e.Message.Equals("[DONE]"))
+                {
+                    return;
+                }
+
+                var answer = "";
+                var promptResult = JsonConvert.DeserializeObject<OpenAIOKResponse>(e.Message);
+
+                if (promptResult != null && promptResult.Choices.Any())
+                {
+                    promptResult.Choices.ForEach(n =>
+                    {
+                        answer += n.Delta.content;
+                    });
+
+                    callBackData.ContentReferences = promptResult.References == null ? "" : JsonConvert.SerializeObject(promptResult.References);
+                }
+                else
+                {
+                    answer = "请求失败，请重试[2001]";
+                }
+
+                callBackData.Message = answer;
+                OnMessage?.Invoke(this, callBackData);
+            };
+            if (OnErrorEvent != null)
+            {
+                eventSource.OnErrorEvent += delegate (object sender, Exception e)
+                {
+                    _logger.LogError(e, $"SessionId={callBackData.SessionId}  提问：{data.messages[0].content} | {ChatApi} 报错：{e.Message}");
+                    if (e.Message.Contains("401") || e.Message.Contains("403"))
+                    {
+                        OnErrorEvent.Invoke(this, new Exception("无权限"), callBackData);
+                    }
+                    else
+                    {
+                        OnErrorEvent.Invoke(this, new Exception("请求失败，请重试[2004]"), callBackData);
+                    }
+                };
+            }
+            if (OnFinishEvent != null)
+            {
+                eventSource.OnCloseEvent += delegate (object sender)
+                {
+                    OnFinishEvent?.Invoke(this, callBackData);
+                };
+            }
+            eventSource?.Open();
+        }
+
+        private bool shouldPause = false;
+
+        // 在需要的时候调用该方法来暂停或者恢复流式输出
+        public void PauseStreaming()
+        {
+            shouldPause = true;
+        }
+
+        public void ResumeStreaming()
+        {
+            shouldPause = false;
+        }
+    }
+    #endregion
+
+    #region OssAgent服务
+    public interface IOssAgentService
+    {
+
+        Task<DevResponseDto<T>> GetTEntityListV2<T>(DataSourceLoadOptionsBase options);
+
+        Task<DevResponseDto<T>> PostGetTEntityV2<T>(DataSourceLoadOptionsBase options);
+        Task<List<T>> GetTEntityDataListV2<T>(DataSourceLoadOptionsBase options);
+
+        Task<T> PostTEntityV2<T>(T model);
+
+        Task<T> PutTEntityV2<T>(string key, T model);
+
+        Task DeleteTEntityV2<T>(string key);
+
+        Task<Dictionary<string, string>?> GetQuestionGeneration(string vecterName, int topN = 5);
+    }
+    public class OssAgentService : BaseClient, IOssAgentService
+    {
+
+        private readonly ILogger<OssAgentService> _logger;
+
+        private readonly IConfiguration _configuration;
+
+        private readonly ILocalStorageService _localStorage;
+        public OssAgentService(ILogger<OssAgentService> logger, IHttpClientFactory httpClientFactory, IConfiguration configuration, ILocalStorageService localStorageService)
+    : base(logger, nameof(OssAgentService), httpClientFactory)
+        {
+            _logger = logger;
+            _configuration = configuration;
+            _localStorage = localStorageService;
+        }
+
+        protected override async Task ConfigClient(HttpClient client)
+        {
+            var userToken = Convert.ToBoolean(_configuration["OssAgentUseUserToken"]);
+            var token = _configuration["OssAgentServiceToken"];
+            if (userToken)
+            {
+                token = await _localStorage.GetItemAsync<string>("oss_token");
+            }
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        }
+
+        public async Task<Dictionary<string, string>?> GetQuestionGeneration(string vecterName, int topN = 5)
+        {
+            var url = $"/api/QuestionGeneration/generate-questions?tableName=km-{vecterName}&numberOfTexts={topN}";
+            _logger.LogInformation($"请求推荐问题接口：{url}");
+
+            var result = await Get<Dictionary<string, string>>(url);
+
+            _logger.LogInformation($"请求推荐问题接口：{url} 返回结果：{JsonConvert.SerializeObject(result)}");
+
+            return result;
+        }
+
+        #region V2接口
+
+        /// <summary>
+        /// 获取列表
+        /// </summary>
+        /// <param name="options"></param>
+        /// <returns></returns>
+        public async Task<DevResponseDto<T>> GetTEntityListV2<T>(DataSourceLoadOptionsBase options)
+        {
+            try
+            {
+                Type type = typeof(T);
+                var str = StringUtil.ModelToUriParam(options, $"/api/v2/List/pgContext/{type?.Name}");
+                return await Get<DevResponseDto<T>>(str);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.ToString());
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 获取列表List
+        /// </summary>
+        /// <param name="options"></param>
+        /// <returns></returns>
+        public async Task<List<T>> GetTEntityDataListV2<T>(DataSourceLoadOptionsBase options)
+        {
+            try
+            {
+                Type type = typeof(T);
+                var str = StringUtil.ModelToUriParam(options, $"/api/v2/List/pgContext/{type?.Name}");
+                var result = await Get<DevResponseDto<T>>(str);
+                if (result != null && result.data != null)
+                {
+                    return result.data;
+                }
+                else
+                {
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.ToString());
+                return null;
+            }
+        }
+
+        public async Task<DevResponseDto<T>> PostGetTEntityV2<T>(DataSourceLoadOptionsBase options)
+        {
+            Type type = typeof(T);
+            var client = CreateHttpClient();
+            await ConfigClient(client);
+            using (var content = new MultipartFormDataContent())
+            {
+                // 添加文本字段
+                content.Add(new StringContent(JsonConvert.SerializeObject(options)), "loadOptionsStr");
+
+                // 发送请求
+                var response = await client.PostAsync($"/api/v2/List/pgContext/{type?.Name}", content);
+
+                // 确保HTTP响应状态为成功
+                response.EnsureSuccessStatusCode();
+
+                // 读取响应内容
+                var responseString = await response.Content.ReadAsStringAsync();
+                var result = JsonConvert.DeserializeObject<DevResponseDto<T>>(responseString);
+                return result;
+            }
+        }
+
+        /// <summary>
+        /// 添加记录
+        /// </summary>
+        /// <param name="model"></param>
+        /// <returns></returns>
+        public async Task<T> PostTEntityV2<T>(T model)
+        {
+            Type type = typeof(T);
+            var a = JsonConvert.SerializeObject(model);
+            return await Post<T>($"/api/v2/Create/pgContext/{type?.Name}", model);
+        }
+
+        /// <summary>
+        /// 修改记录
+        /// </summary>
+        /// <param name="model"></param>
+        /// <returns></returns>
+        public async Task<T> PutTEntityV2<T>(string key, T model)
+        {
+            // 获取泛型参数的类型
+            Type type = typeof(T);
+            return await Put<T>($"/api/v2/Update/pgContext/{type?.Name}/{key}", model);
+        }
+
+        /// <summary>
+        /// 删除记录
+        /// </summary>
+        /// <param name="id"></param>
+        /// <returns></returns>
+        public async Task DeleteTEntityV2<T>(string key)
+        {
+            Type type = typeof(T);
+            await Delete($"/api/v2/Delete/pgContext/{type?.Name}/{key}");
+        }
+        #endregion
+    }
+    #endregion
+    #endregion
+
+}
+
+<script>
+    function scrollListBoxToBottom(listBoxId) {
+        // 通过ID找到DxListBox的DOM元素
+        var listBox = document.getElementById(listBoxId);
+        if (listBox) {
+            // 假设DxListBox内部的滚动容器有特定的类名
+            var scrollContainer = listBox.querySelector('.dxbl-scroll-viewer-content');
+
+            // 如果存在滚动容器，则滚动到底部
+            if (scrollContainer) {
+                scrollContainer.scrollTop = scrollContainer.scrollHeight;
+            }
+        }
+    }
+
+    window.registerScrollEvent = (listBoxId, dotNetHelper) => {
+        var listBox = document.getElementById(listBoxId);
+        if (listBox) {
+            // 假设DxListBox内部的滚动容器有特定的类名
+            var scrollContainer = listBox.querySelector('.dxbl-scroll-viewer-content');
+
+            // 如果存在滚动容器，则滚动到底部
+            if (scrollContainer) {
+                scrollContainer.addEventListener('scroll', () => {
+                    if (scrollContainer.scrollTop === 0) {
+                        dotNetHelper.invokeMethodAsync('LoadMoreData');
+                    }
+                });
+            }
+        }
+    };
+</script>
+
+<style>
+    .chat-window-body {
+        padding: 0 !important;
+    }
+
+        .chat-window-body ul::before {
+            background-color: white !important;
+        }
+
+        .chat-window-body :focus {
+            outline: none !important;
+        }
+
+    .chat-content-left {
+        text-align: left;
+    }
+
+    .chat-message-ai {
+        position: relative;
+        background-color: #f2f2f2c7;
+        margin: 5px 0;
+        border-radius: 5px;
+        padding: 5px;
+        display: inline-grid;
+        text-align: left;
+        max-width: 90%;
+    }
+
+    .chat-message-user {
+        position: relative;
+        background-color: #E8F1FB;
+        margin: 5px 0;
+        border-radius: 5px;
+        padding: 5px;
+        display: inline-grid;
+        text-align: left;
+        max-width: 90%;
+    }
+
+    .chat-message-left {
+        position: relative;
+        background-color: #f2f2f2c7;
+        margin: 5px 0;
+        border-radius: 5px;
+        padding: 5px;
+        display: inline-grid;
+        text-align: left;
+        max-width: 90vw;
+    }
+
+    .chat-message-right {
+        margin: 5px 0;
+        padding: 5px;
+        border-radius: 5px;
+        background-color: #E8F1FB;
+        display: inline-grid;
+        text-align: left;
+        max-width: 90vw;
+    }
+
+    .chat-content-right {
+        text-align: right;
+    }
+
+    .chat-content-listbox {
+        width: 100%;
+        height: 100%;
+        font-size: 15px !important;
+        border-top-color:white;
+    }
+
+        .chat-content-listbox p {
+            margin: 0 !important;
+        }
+
+    .chat-send-button {
+        position: absolute;
+        background-color: #337ab7 !important;
+        border-radius: 50%;
+        width: 32px;
+        right: 10px;
+        bottom: 31px;
+        border: none;
+    }
+
+    .icp {
+        font-size: 11px;
+        color: #686868;
+        width: 100%;
+        text-align: center;
+    }
+
+    table {
+        border-width: 1px;
+        border-color: #666666;
+        border-collapse: collapse;
+    }
+
+    th {
+        border-width: 1px;
+        padding: 8px;
+        border-style: solid;
+        border-color: #666666;
+        background-color: #dedede;
+    }
+
+    td {
+        border-width: 1px;
+        padding: 8px;
+        border-style: solid;
+        border-color: #666666;
+        background-color: #ffffff;
+    }
+
+    a {
+        color: #0366d6;
+        text-decoration: none;
+    }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+    code:not([class]) {
+        padding: 0.2em 0.4em;
+        margin: 0;
+        font-size: 85%;
+        background-color: rgba(27,31,35,0.05);
+        border-radius: 3px;
+    }
+
+    .mini-btn {
+        padding: 0;
+    }
+
+    .chat-photo {
+        width: 25px;
+        height: 25px;
+        border-radius: 18px;
+        display: inline-flex;
+        line-height: 12px;
+        align-items: center;
+    }
+
+    .chat-time {
+        font-size: 12px;
+        width: 180px;
+        color: #999;
+        vertical-align: bottom;
+    }
+
+    .chat-DxStackLayout {
+        /* height: 80vh;*/
+        height: 100%;
+        width: 100%;
+    }
+
+    .chat-toolbar-item{
+        font-size: 11px;
+        width: 100%;
+        justify-content: start;
+    }
+
+    .dxbl-btn-group-first{
+        padding-left:5px !important;
+    }
+
+    .dxbl-btn-group {
+        padding: 5px 0;
+    }
+
+    .toolbar-button-container {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+
+    .change-batch-button {
+        margin-left: 5px; /* 根据需要调整间距 */
+        font-size: 11px;
+    }
+
+    .empty-data-button
+    {
+        height: 75px;
+        width:150px;
+    }
+
+    .empty-data-button > span {
+        text-align: left;
+        font-size: 13px;
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: normal;
+    }
+
+    .empty-data-img{
+        display: block;
+        width: 100%;
+        text-align: center;
+    }
+
+    .empty-data-container {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px; /* 按需调整按钮之间的间距 */
+        justify-content: center;
+    }
+
+    .dxbl-list-box-render-container > .dxbl-scroll-viewer > .dxbl-scroll-viewer-content > ul > li:not([dxbl-bottom-virtual-spacer-element]):not([dxbl-top-virtual-spacer-element]), .dxbl-list-box > .dxbl-scroll-viewer > .dxbl-scroll-viewer-content > ul > li:not([dxbl-bottom-virtual-spacer-element]):not([dxbl-top-virtual-spacer-element]){
+        background-color:white;
+    }
+
+    code {
+        word-wrap: break-word; /* 旧的属性名 */
+        overflow-wrap: break-word; /* 新的属性名，推荐使用 */
+        white-space: pre-wrap; /* 保留空白字符，但允许换行 */
+    }
+
+    .icon-send-fill {
+        width: 16px;
+        height: 16px;
+        -webkit-mask-box-image: url("images/chat/send-fill.svg");
+        mask: url("images/chat/send-fill.svg") no-repeat center; /* 其他浏览器支持的备用属性 */
+        background-color: currentColor;
+        color: white;
+    }
+
+    .dxbl-text-edit {
+        --dxbl-text-edit-focus-shadow-color: none !important;
+        --dxbl-text-edit-focus-border-color: #337ab7 !important;
+    }
+
+    .dxbl-wait-indicator {
+        --dxbl-wait-indicator-color: #337ab7 !important;
+    }
+</style>
